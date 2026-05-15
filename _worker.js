@@ -1,7 +1,7 @@
 // 配置信息
-let enable_stream = false; // true:流式生成文本(该模式必须绑定 "Workers AI" )，false:非流式生成文本(等待文本生成完毕才显示，该模式必须配置 cf_account_array 参数)
-let api_key = 'sk-xxxxxxxxxxxxxxxxx'; // 自己随意定义的（建议使用字母、数字），等同 OpenAI_Api_Key ，建议以"sk-"开头，方便区分
-let cf_account_array = [{ account_id: 'xxxxxxxxxxxxxxxxx', token: 'xxxxxxxxxxxxxxxxx' }]; // 可以多配置几个账号，随机切换使用
+let enable_stream = true; // true:流式生成文本(该模式必须绑定 "Workers AI" )，false:非流式生成文本(等待文本生成完毕才显示，该模式必须配置 cf_account_array 参数)
+let api_key = 'sk-xxxxxxx'; // 自己随意定义的（建议使用字母、数字），等同 OpenAI_Api_Key ，建议以"sk-"开头，方便区分
+let cf_account_array = [{ account_id: 'xxxxxxx', token: 'xxxxxxx' }]; // 可以多配置几个账号，随机切换使用
 // ——————————————————————————————————————————————————————————————————————————————————————————————————————————————————————————————————
 let cf_account_map = new Map(); // 正在使用的account_id和token（映射）
 
@@ -56,7 +56,7 @@ const TEXT_GENERATION_MODELS = {
 	'una-cybertron-7b-v2-bf16': '@cf/fblgit/una-cybertron-7b-v2-bf16',
 	'zephyr-7b-beta-awq': '@hf/thebloke/zephyr-7b-beta-awq',
 };
-const DEFAULT_MODEL = 'gemma-7b-it-lora'; // 默认模型，根据 TEXT_GENERATION_MODELS 的 key 键修改
+const DEFAULT_MODEL = 'deepseek-r1-distill-qwen-32b'; // 默认模型，根据 TEXT_GENERATION_MODELS 的 key 键修改
 
 // 主处理函数
 var worker_default = {
@@ -128,10 +128,16 @@ function handleModelsRequest() {
 async function handleChatCompletions(request, env) {
 	try {
 		// messages 是一个数组，每个元素都是一个对象，包含消息内容和角色信息；requestedModel是客户端中，选择的要使用的模型
-		const { messages, model: requestedModel } = await request.json();
+		const { messages, model: requestedModel, stream: clientStream } = await request.json();
 
 		// 获取最后一个用户消息（最新用户发送的消息）
-		const userMessage = messages.findLast((msg) => msg.role === 'user')?.content;
+		let userMessage;
+		for (let i = messages.length - 1; i >= 0; i--) {
+			if (messages[i].role === 'user') {
+				userMessage = messages[i].content;
+				break;
+			}
+		}
 		if (!userMessage) {
 			return new Response(JSON.stringify({ error: '未找到用户消息' }), { status: 400, headers: { 'Content-Type': 'application/json' } });
 		}
@@ -140,7 +146,10 @@ async function handleChatCompletions(request, env) {
 		const FIRST_MODEL = Object.keys(TEXT_GENERATION_MODELS)[0];
 		let model = TEXT_GENERATION_MODELS[requestedModel] || TEXT_GENERATION_MODELS[DEFAULT_MODEL] || FIRST_MODEL;
 
-		if (enable_stream) {
+		// 优先使用客户端请求中的 stream 参数，其次使用 enable_stream 配置
+		const shouldStream = clientStream !== undefined ? clientStream : enable_stream;
+
+		if (shouldStream) {
 			// 流式响应
 			return handleStreamResponse(env, model, messages);
 		} else {
@@ -234,35 +243,28 @@ async function handleNonStreamResponse(model, messagesArray) {
 		const generatedContentString = await getGenerateContent(model, messagesArray);
 		console.log(`非流式响应，正文内容: ${generatedContentString}`);
 
-		const encoder = new TextEncoder();
-		const stream = new ReadableStream({
-			start(controller) {
-				controller.enqueue(
-					encoder.encode(
-						`data: ${JSON.stringify({
-							id: `chatcmpl-${Date.now()}`,
-							object: 'chat.completion.chunk',
-							created: Math.floor(Date.now() / 1000),
-							model: model,
-							choices: [{ delta: { content: generatedContentString }, index: 0, finish_reason: null }],
-						})}\n\n`
-					)
-				);
-				controller.enqueue(encoder.encode('data: [DONE]\n\n'));
-				controller.close();
-			},
-		});
-		console.log(`非流式响应，返回的数据：${stream}`);
-
-		// 返回一个非流式响应
-		return new Response(stream, {
-			headers: {
-				'Content-Type': 'text/event-stream',
-				'Access-Control-Allow-Origin': '*',
-				'Cache-Control': 'no-cache',
-				Connection: 'keep-alive',
-			},
-		});
+		// 返回标准的非流式JSON响应
+		return new Response(
+			JSON.stringify({
+				id: `chatcmpl-${Date.now()}`,
+				object: 'chat.completion',
+				created: Math.floor(Date.now() / 1000),
+				model: model,
+				choices: [
+					{
+						message: { role: 'assistant', content: generatedContentString },
+						index: 0,
+						finish_reason: 'stop',
+					},
+				],
+			}),
+			{
+				headers: {
+					'Content-Type': 'application/json',
+					'Access-Control-Allow-Origin': '*',
+				},
+			}
+		);
 	} catch (error) {
 		throw new Error('内容生成失败: ' + error.message);
 	}
